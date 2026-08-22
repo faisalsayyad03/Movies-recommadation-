@@ -21,12 +21,6 @@ load_dotenv()
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
-if not TMDB_API_KEY:
-    raise RuntimeError(
-        "TMDB_API_KEY is missing. "
-        "Add TMDB_API_KEY in Render Environment Variables."
-    )
-
 
 # ==========================================================
 # CONFIG
@@ -95,6 +89,11 @@ TFIDF_MATRIX_PATH = os.path.join(
 TFIDF_PATH = os.path.join(
     BASE_DIR,
     "tfidf.pkl"
+)
+
+CSV_PATH = os.path.join(
+    BASE_DIR,
+    "movies_metadata.csv"
 )
 
 
@@ -225,6 +224,12 @@ async def tmdb_get(
     path: str,
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
+
+    if not TMDB_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="TMDB_API_KEY is not configured on the backend.",
+        )
 
     query = dict(params)
 
@@ -642,6 +647,47 @@ async def attach_tmdb_card_by_title(
 # LOAD PICKLE FILES
 # ==========================================================
 
+def build_dataset_from_csv() -> pd.DataFrame:
+
+    if not os.path.exists(CSV_PATH):
+        raise RuntimeError(f"Dataset not found: {CSV_PATH}")
+
+    source = pd.read_csv(CSV_PATH)
+    source = source.drop_duplicates().reset_index(drop=True)
+    source = source[
+        ["title", "overview", "genres", "tagline", "vote_average", "popularity"]
+    ]
+    source = source.dropna(subset=["title"]).copy()
+    source["overview"] = source["overview"].fillna("")
+    source["tagline"] = source["tagline"].fillna("")
+
+    def parse_genres(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        try:
+            return " ".join(
+                item["name"]
+                for item in __import__("ast").literal_eval(value)
+                if isinstance(item, dict) and item.get("name")
+            )
+        except (ValueError, SyntaxError, TypeError):
+            return ""
+
+    source["genres"] = source["genres"].map(parse_genres)
+    source["tags"] = (
+        source["overview"] + " " + source["genres"] + " " + source["tagline"]
+    )
+    return source
+
+
+def load_pickle(path: str, label: str) -> Any:
+    try:
+        with open(path, "rb") as file:
+            return pickle.load(file)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError, ValueError) as error:
+        print(f"{label} unavailable ({error}); using fallback when supported.")
+        return None
+
 @app.on_event("startup")
 def load_pickles():
 
@@ -659,109 +705,32 @@ def load_pickles():
     # df.pkl
     # ------------------------------------------------------
 
-    try:
-
-        print("Loading df.pkl...")
-
-        with open(
-            DF_PATH,
-            "rb",
-        ) as file:
-
-            df = pickle.load(
-                file
-            )
-
-        print(
-            f"df.pkl loaded: "
-            f"{len(df)} rows"
-        )
-
-    except Exception as error:
-
-        raise RuntimeError(
-            f"Failed to load df.pkl: {error}"
-        )
+    df = load_pickle(DF_PATH, "df.pkl")
+    if not isinstance(df, pd.DataFrame) or "title" not in df.columns:
+        df = build_dataset_from_csv()
+    print(f"Dataset loaded: {len(df)} rows")
 
     # ------------------------------------------------------
     # indices.pkl
     # ------------------------------------------------------
 
-    try:
-
-        print("Loading indices.pkl...")
-
-        with open(
-            INDICES_PATH,
-            "rb",
-        ) as file:
-
-            indices_obj = pickle.load(
-                file
-            )
-
-        print("indices.pkl loaded")
-
-    except Exception as error:
-
-        raise RuntimeError(
-            f"Failed to load indices.pkl: {error}"
-        )
+    indices_obj = load_pickle(INDICES_PATH, "indices.pkl")
+    if indices_obj is None:
+        indices_obj = pd.Series(df.index, index=df["title"]).drop_duplicates()
 
     # ------------------------------------------------------
     # tfidf_matrix.pkl
     # ------------------------------------------------------
 
-    try:
-
-        print(
-            "Loading tfidf_matrix.pkl..."
-        )
-
-        with open(
-            TFIDF_MATRIX_PATH,
-            "rb",
-        ) as file:
-
-            tfidf_matrix = pickle.load(
-                file
-            )
-
-        print(
-            "tfidf_matrix.pkl loaded"
-        )
-
-    except Exception as error:
-
-        raise RuntimeError(
-            "Failed to load "
-            f"tfidf_matrix.pkl: {error}"
-        )
+    tfidf_matrix = load_pickle(TFIDF_MATRIX_PATH, "tfidf_matrix.pkl")
+    if tfidf_matrix is None:
+        raise RuntimeError("tfidf_matrix.pkl is missing or invalid.")
 
     # ------------------------------------------------------
     # tfidf.pkl
     # ------------------------------------------------------
 
-    try:
-
-        print("Loading tfidf.pkl...")
-
-        with open(
-            TFIDF_PATH,
-            "rb",
-        ) as file:
-
-            tfidf_obj = pickle.load(
-                file
-            )
-
-        print("tfidf.pkl loaded")
-
-    except Exception as error:
-
-        raise RuntimeError(
-            f"Failed to load tfidf.pkl: {error}"
-        )
+    tfidf_obj = load_pickle(TFIDF_PATH, "tfidf.pkl")
 
     # ------------------------------------------------------
     # BUILD INDEX
@@ -790,17 +759,9 @@ def load_pickles():
     # VALIDATION
     # ------------------------------------------------------
 
-    if df is None:
-
+    if len(df) != tfidf_matrix.shape[0]:
         raise RuntimeError(
-            "df.pkl is empty."
-        )
-
-    if "title" not in df.columns:
-
-        raise RuntimeError(
-            "df.pkl must contain "
-            "'title' column."
+            f"Dataset rows ({len(df)}) do not match TF-IDF rows ({tfidf_matrix.shape[0]})."
         )
 
     print("====================================")
